@@ -14,13 +14,14 @@ from telegram.ext import (
     ContextTypes,
     Defaults,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
 from .calendar import CalendarSettings, ensure_calendar_seeded
 from .config import KST, Settings
 from .date_utils import parse_yyyymmdd_to_iso, today_kst_date_str
-from .db import Database
+from .db import get_connection, migrate
 from .market import KrxApiMarketData, PykrxMarketData
 from .notifier import TelegramNotifier
 from .service import DailyBatchRunner, SSSService
@@ -84,7 +85,7 @@ async def register_handlers(app: Application, service: SSSService, batch: DailyB
         if update.effective_user is None or update.effective_chat is None:
             return
         uid = str(update.effective_chat.id)
-        service.ensure_user(uid)
+        service.upsert_user_on_start(uid)
         await update.message.reply_text(
             "SSS 봇이 시작되었습니다.\n"
             "손절 설정: /s 10\n"
@@ -92,6 +93,12 @@ async def register_handlers(app: Application, service: SSSService, batch: DailyB
             "상태 확인: /status\n"
             "도움말: /help"
         )
+
+    async def touch_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_chat is None:
+            return
+        uid = str(update.effective_chat.id)
+        service.touch_user_activity(uid)
 
     async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(help_text)
@@ -269,6 +276,7 @@ async def register_handlers(app: Application, service: SSSService, batch: DailyB
         await batch.run()
         await update.message.reply_text("일일 배치를 실행했습니다.")
 
+    app.add_handler(TypeHandler(Update, touch_activity), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("s", set_stop))
@@ -286,8 +294,8 @@ async def register_handlers(app: Application, service: SSSService, batch: DailyB
 
 async def main_async() -> None:
     settings = Settings.from_env()
-    db = Database(settings.db_path)
-    db.init_schema()
+    db = get_connection(settings.db_path)
+    migrate(db)
     now = datetime.now(tz=KST).date()
     calendar_settings = CalendarSettings(
         past_days=settings.calendar_past_days,

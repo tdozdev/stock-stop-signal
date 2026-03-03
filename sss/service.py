@@ -6,6 +6,7 @@ from datetime import datetime
 from logging import getLogger
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest, Forbidden, TelegramError
 
 from .calendar import (
     CalendarSettings,
@@ -82,6 +83,12 @@ class SSSService:
 
     def ensure_user(self, telegram_id: str) -> None:
         self.db.ensure_user(telegram_id)
+
+    def upsert_user_on_start(self, telegram_id: str) -> None:
+        self.db.upsert_user_on_start(telegram_id)
+
+    def touch_user_activity(self, telegram_id: str) -> None:
+        self.db.touch_user_activity(telegram_id)
 
     def set_stop_loss(self, telegram_id: str, stop_loss_pct: float) -> None:
         if stop_loss_pct <= 0:
@@ -419,7 +426,7 @@ class DailyBatchRunner:
                 if float(close) > float(h["peak_price"]):
                     self.db.update_peak(h["id"], float(close), trading_date, float(kospi_close))
 
-        users = self.db.list_users()
+        users = self.db.list_users(active_only=True)
         for user in users:
             telegram_id = user["telegram_id"]
             holdings = self.db.list_holdings(telegram_id)
@@ -461,9 +468,12 @@ class DailyBatchRunner:
             if triggered and self.db.insert_notification(
                 trading_date, telegram_id, "__ALL__", "summary"
             ):
-                await self.notifier.send_message(
-                    telegram_id,
-                    self.render_trigger_summary(
+                await self._send_with_result(
+                    trading_date=trading_date,
+                    telegram_id=telegram_id,
+                    symbol="__ALL__",
+                    ntype="summary",
+                    text=self.render_trigger_summary(
                         send_date,
                         trading_date,
                         float(user["stop_loss_pct"]),
@@ -477,9 +487,12 @@ class DailyBatchRunner:
                 and not triggered
                 and self.db.insert_notification(trading_date, telegram_id, "__ALL__", "daily_report")
             ):
-                await self.notifier.send_message(
-                    telegram_id,
-                    self.render_daily_report(
+                await self._send_with_result(
+                    trading_date=trading_date,
+                    telegram_id=telegram_id,
+                    symbol="__ALL__",
+                    ntype="daily_report",
+                    text=self.render_daily_report(
                         send_date,
                         trading_date,
                         float(user["stop_loss_pct"]),
@@ -592,3 +605,77 @@ class DailyBatchRunner:
         if cached is not None:
             return cached
         return self.db.get_latest_price(symbol)
+
+    async def _send_with_result(
+        self,
+        trading_date: str,
+        telegram_id: str,
+        symbol: str,
+        ntype: str,
+        text: str,
+        reply_markup=None,
+    ) -> None:
+        try:
+            await self.notifier.send_message(telegram_id, text, reply_markup=reply_markup)
+            self.db.upsert_notification_result(
+                trading_date,
+                telegram_id,
+                symbol,
+                ntype,
+                status="success",
+                error=None,
+            )
+        except Forbidden as exc:
+            self.logger.warning("Telegram blocked user %s: %s", telegram_id, exc)
+            self.db.mark_user_blocked(telegram_id)
+            self.db.upsert_notification_result(
+                trading_date,
+                telegram_id,
+                symbol,
+                ntype,
+                status="blocked",
+                error=str(exc),
+            )
+        except BadRequest as exc:
+            msg = str(exc).lower()
+            if "chat not found" in msg or "forbidden" in msg:
+                self.logger.warning("Telegram blocked/not-found user %s: %s", telegram_id, exc)
+                self.db.mark_user_blocked(telegram_id)
+                self.db.upsert_notification_result(
+                    trading_date,
+                    telegram_id,
+                    symbol,
+                    ntype,
+                    status="blocked",
+                    error=str(exc),
+                )
+                return
+            self.logger.warning("Telegram send failed for %s: %s", telegram_id, exc)
+            self.db.upsert_notification_result(
+                trading_date,
+                telegram_id,
+                symbol,
+                ntype,
+                status="fail",
+                error=str(exc),
+            )
+        except TelegramError as exc:
+            self.logger.warning("Telegram send failed for %s: %s", telegram_id, exc)
+            self.db.upsert_notification_result(
+                trading_date,
+                telegram_id,
+                symbol,
+                ntype,
+                status="fail",
+                error=str(exc),
+            )
+        except Exception as exc:
+            self.logger.warning("Telegram send unexpected failure for %s: %s", telegram_id, exc)
+            self.db.upsert_notification_result(
+                trading_date,
+                telegram_id,
+                symbol,
+                ntype,
+                status="fail",
+                error=str(exc),
+            )

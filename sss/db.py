@@ -12,6 +12,9 @@ CREATE TABLE IF NOT EXISTS users (
   telegram_id TEXT PRIMARY KEY,
   stop_loss_pct REAL DEFAULT 10,
   daily_report INTEGER DEFAULT 0,
+  is_active INTEGER NOT NULL DEFAULT 1,
+  blocked_at TEXT,
+  last_seen_at TEXT,
   created_at TEXT,
   updated_at TEXT
 );
@@ -43,6 +46,9 @@ CREATE TABLE IF NOT EXISTS notifications (
   telegram_id TEXT,
   symbol TEXT,
   type TEXT,
+  status TEXT NOT NULL DEFAULT 'success',
+  sent_at TEXT,
+  error TEXT,
   PRIMARY KEY(trading_date, telegram_id, symbol, type)
 );
 
@@ -64,6 +70,12 @@ class Database:
         self.path = path
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._configure_pragmas()
+
+    def _configure_pragmas(self) -> None:
+        self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA synchronous = NORMAL")
+        self.conn.execute("PRAGMA busy_timeout = 5000")
         self.conn.execute("PRAGMA foreign_keys = ON")
 
     def close(self) -> None:
@@ -74,20 +86,85 @@ class Database:
 
     def init_schema(self) -> None:
         self.conn.executescript(SCHEMA_SQL)
+        self._migrate_schema()
         self.conn.commit()
+
+    def _migrate_schema(self) -> None:
+        self._add_column_if_missing("users", "is_active INTEGER NOT NULL DEFAULT 1")
+        self._add_column_if_missing("users", "blocked_at TEXT")
+        self._add_column_if_missing("users", "last_seen_at TEXT")
+        self._add_column_if_missing("notifications", "status TEXT NOT NULL DEFAULT 'success'")
+        self._add_column_if_missing("notifications", "sent_at TEXT")
+        self._add_column_if_missing("notifications", "error TEXT")
+
+    def _add_column_if_missing(self, table: str, column_sql: str) -> None:
+        column = column_sql.split()[0]
+        cols = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        if any(str(row["name"]) == column for row in cols):
+            return
+        self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_sql}")
 
     def ensure_user(self, telegram_id: str) -> sqlite3.Row:
         now = self.now_iso()
         self.conn.execute(
             """
-            INSERT INTO users (telegram_id, created_at, updated_at)
-            VALUES (?, ?, ?)
+            INSERT INTO users (telegram_id, created_at, updated_at, last_seen_at, is_active)
+            VALUES (?, ?, ?, ?, 1)
             ON CONFLICT(telegram_id) DO NOTHING
             """,
-            (telegram_id, now, now),
+            (telegram_id, now, now, now),
         )
         self.conn.commit()
         return self.get_user(telegram_id)
+
+    def upsert_user_on_start(self, telegram_id: str) -> sqlite3.Row:
+        now = self.now_iso()
+        self.conn.execute(
+            """
+            INSERT INTO users (
+              telegram_id, created_at, updated_at, last_seen_at, is_active, blocked_at
+            )
+            VALUES (?, ?, ?, ?, 1, NULL)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+              updated_at = excluded.updated_at,
+              last_seen_at = excluded.last_seen_at,
+              is_active = 1,
+              blocked_at = NULL
+            """,
+            (telegram_id, now, now, now),
+        )
+        self.conn.commit()
+        return self.get_user(telegram_id)
+
+    def touch_user_activity(self, telegram_id: str) -> None:
+        now = self.now_iso()
+        self.conn.execute(
+            """
+            INSERT INTO users (
+              telegram_id, created_at, updated_at, last_seen_at, is_active, blocked_at
+            )
+            VALUES (?, ?, ?, ?, 1, NULL)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+              updated_at = excluded.updated_at,
+              last_seen_at = excluded.last_seen_at,
+              is_active = 1,
+              blocked_at = NULL
+            """,
+            (telegram_id, now, now, now),
+        )
+        self.conn.commit()
+
+    def mark_user_blocked(self, telegram_id: str) -> None:
+        now = self.now_iso()
+        self.conn.execute(
+            """
+            UPDATE users
+            SET is_active = 0, blocked_at = ?, updated_at = ?
+            WHERE telegram_id = ?
+            """,
+            (now, now, telegram_id),
+        )
+        self.conn.commit()
 
     def get_user(self, telegram_id: str) -> sqlite3.Row:
         row = self.conn.execute(
@@ -98,7 +175,12 @@ class Database:
             raise KeyError("user not found")
         return row
 
-    def list_users(self) -> list[sqlite3.Row]:
+    def list_users(self, active_only: bool = False) -> list[sqlite3.Row]:
+        if active_only:
+            rows = self.conn.execute(
+                "SELECT * FROM users WHERE is_active = 1 ORDER BY telegram_id"
+            ).fetchall()
+            return list(rows)
         rows = self.conn.execute("SELECT * FROM users ORDER BY telegram_id").fetchall()
         return list(rows)
 
@@ -269,13 +351,40 @@ class Database:
     ) -> bool:
         cur = self.conn.execute(
             """
-            INSERT OR IGNORE INTO notifications (trading_date, telegram_id, symbol, type)
-            VALUES (?, ?, ?, ?)
+            INSERT OR IGNORE INTO notifications (
+              trading_date, telegram_id, symbol, type, status, sent_at, error
+            )
+            VALUES (?, ?, ?, ?, 'success', ?, NULL)
             """,
-            (trading_date, telegram_id, symbol, ntype),
+            (trading_date, telegram_id, symbol, ntype, self.now_iso()),
         )
         self.conn.commit()
         return cur.rowcount == 1
+
+    def upsert_notification_result(
+        self,
+        trading_date: str,
+        telegram_id: str,
+        symbol: str,
+        ntype: str,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        sent_at = self.now_iso()
+        self.conn.execute(
+            """
+            INSERT INTO notifications (
+              trading_date, telegram_id, symbol, type, status, sent_at, error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(trading_date, telegram_id, symbol, type) DO UPDATE SET
+              status = excluded.status,
+              sent_at = excluded.sent_at,
+              error = excluded.error
+            """,
+            (trading_date, telegram_id, symbol, ntype, status, sent_at, error),
+        )
+        self.conn.commit()
 
     def has_notification(
         self, trading_date: str, telegram_id: str, symbol: str, ntype: str
@@ -352,3 +461,11 @@ class Database:
         if row is None or row[0] is None:
             return None
         return str(row[0])
+
+
+def get_connection(path: str) -> Database:
+    return Database(path)
+
+
+def migrate(db: Database) -> None:
+    db.init_schema()

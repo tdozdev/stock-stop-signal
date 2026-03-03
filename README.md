@@ -104,3 +104,33 @@ SSS_KRX_TIMEOUT_SEC=10
 - 종목 종가는 `TDD_CLSPRC`, 종목코드는 `ISU_CD`, 종목명은 `ISU_NM`을 사용합니다.
 - ETF 종가는 `SSS_KRX_ETF_DAILY_PATH`(기본: `/svc/apis/etp/etf_bydd_trd`) 승인 시 함께 수집됩니다.
 - KOSPI 지수 종가는 `CLSPRC_IDX`를 사용합니다.
+
+## 운영 안정화(사용자 상태/발송 로그)
+- `users`에 `is_active`, `blocked_at`, `last_seen_at` 컬럼을 사용합니다.
+- 어떤 업데이트든 수신되면 `last_seen_at`을 갱신하고 `is_active=1`, `blocked_at=NULL`로 복구합니다.
+- `/start`는 신규 사용자 생성 또는 기존 사용자 복구(재활성화)를 수행합니다.
+- 자동 알림 발송 결과는 `notifications.status`(`success`/`blocked`/`fail`)로 기록합니다.
+- 차단/삭제된 사용자(Forbidden, `chat not found`)는 `is_active=0` 처리되어 이후 배치 발송 대상에서 제외됩니다.
+- SQLite는 `WAL`, `busy_timeout=5000`, `synchronous=NORMAL`, `foreign_keys=ON` 설정으로 동작합니다.
+
+## 수동 테스트 시나리오
+1. 신규 유저 `/start`
+- `users.created_at`이 최초 1회만 기록되는지 확인
+- `is_active=1`, `last_seen_at` 갱신 확인
+
+2. `daily_report=off` 유저 활동 확인
+- `/status` 또는 `/r` 실행 후 `last_seen_at`이 최신으로 갱신되는지 확인
+
+3. 차단 사용자 자동 제외
+- 봇을 차단한 계정 대상으로 배치 실행
+- `users.is_active=0`, `blocked_at` 기록 확인
+- `notifications`에 해당 발송 건 `status='blocked'` 기록 확인
+
+4. 재설치(/start) 복구
+- 차단 해제 후 `/start` 실행
+- `is_active=1`, `blocked_at=NULL`, `last_seen_at` 최신화 확인
+
+5. 발송 결과 기록
+- 정상 발송: `notifications.status='success'`
+- 차단/삭제: `notifications.status='blocked'`
+- 일시 오류: `notifications.status='fail'`, `error` 컬럼 메시지 확인

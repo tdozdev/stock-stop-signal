@@ -1,0 +1,13 @@
+services:
+  sss:
+    build:
+      context: ../apps/bot
+      dockerfile: Dockerfile
+    container_name: stock-stop-signal
+    env_file:
+      - ../.env
+    environment:
+      SSS_DB_PATH: /data/sss.db
+    volumes:
+      - ../data:/data
+    restart: unless-stopped
